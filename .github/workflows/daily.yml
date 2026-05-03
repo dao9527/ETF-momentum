@@ -1,0 +1,18 @@
+name: Daily ETF Strategy
+on:
+  schedule:
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install akshare pandas numpy requests baostock
+      - name: Run Strategy
+        run: python strategy.py
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
