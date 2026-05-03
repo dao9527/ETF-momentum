@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-V6.2.2 最终挂机版 · 防翻车补丁
-- 融合 baostock 单次登录（避免频繁登录/登出）
-- 数据冻结时记录 signal（便于复盘）
-- 指数异常阈值参数化（INDEX_STOP）
+V6.2.2 最终挂机版（防周末/长假崩溃 + 工程稳定补丁）
+- 双数据源，baostock 全局只登录一次
+- 指数获取失败不崩溃，推送并返回
+- validate_data 允许数据滞后最多 5 天
+- 数据冻结 & 指数异常保护
 """
 import os
 import json
@@ -30,7 +31,7 @@ CONFIG = {
     "SLIPPAGE": 0.001,
     "COMMISSION": 0.0005,
     "MIN_AMOUNT": 5e7,
-    "INDEX_STOP": 0.08,          # ✅ 参数化
+    "INDEX_STOP": 0.08,          # 指数异常波动阈值
 }
 ETF_POOL = {
     "159875": "新能源",
@@ -83,24 +84,25 @@ def release_lock():
 def validate_data(df):
     if df is None or len(df) < 30:
         return False
-    if (datetime.now().date() - df.index[-1].date()).days > 1:
+    # 允许周末 + 长假（最多 5 天）
+    if (datetime.now().date() - df.index[-1].date()).days > 5:
         return False
     if df['close'].iloc[-1] <= 0 or df['close'].isna().any():
         return False
     return True
 
-# ================= 数据（使用全局 bs） =================
+# ================= 数据（传入全局 bs） =================
 def get_index(bs=None):
-    # 首选 akshare
+    # 优先 akshare
     try:
         df = ak.stock_zh_index_daily_em(symbol=CONFIG["INDEX_CODE"])
         df['date'] = pd.to_datetime(df['date'])
         df = df.set_index('date')[['close']]
         if validate_data(df):
             return df
-    except:
-        pass
-    # 备选 baostock（传入全局 bs）
+    except Exception as e:
+        logger.warning(f"akshare 指数失败: {e}")
+    # 备用 baostock
     if bs is not None:
         try:
             rs = bs.query_history_k_data_plus(
@@ -110,16 +112,19 @@ def get_index(bs=None):
                 end_date=datetime.now().strftime('%Y-%m-%d')
             )
             df = rs.get_data()
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.set_index('date')[['close']].astype(float)
-            if validate_data(df):
-                return df
-        except:
-            pass
-    raise RuntimeError("指数数据失败")
+            if not df.empty:
+                df['date'] = pd.to_datetime(df['date'])
+                df = df.set_index('date')[['close']].astype(float)
+                if validate_data(df):
+                    return df
+        except Exception as e:
+            logger.warning(f"baostock 指数失败: {e}")
+    # 两个数据源都失败
+    push("❌ 指数数据获取失败，跳过今日")
+    return None
 
 def get_etf(code, bs=None):
-    # 首选 akshare
+    # 优先 akshare
     try:
         df = ak.fund_etf_hist_em(symbol=code)
         if df is not None and not df.empty:
@@ -133,7 +138,7 @@ def get_etf(code, bs=None):
                 return df[['close']]
     except:
         pass
-    # 备选 baostock（传入全局 bs）
+    # 备用 baostock
     if bs is not None:
         try:
             bs_code = f"sh.{code}" if code.startswith('51') else f"sz.{code}"
@@ -192,7 +197,7 @@ def main():
         logger.warning("已有实例运行，跳过")
         return
 
-    # ✅ 全局登录 baostock（一次）
+    # 全局登录 baostock（一次）
     bs = None
     try:
         import baostock as bs
@@ -202,12 +207,15 @@ def main():
 
     try:
         idx = get_index(bs=bs)
+        if idx is None:
+            return   # 已经推送过错误消息
+
         etfs = {name: get_etf(code, bs=bs) for code, name in ETF_POOL.items()}
         etfs = {k: v for k, v in etfs.items() if v is not None}
 
-        today = datetime.now().date()   # 今日日期，用于信号文件名等
+        today = datetime.now().date()
 
-        # ✅ 数据冻结保护（现在写 signal）
+        # 数据冻结保护
         if len(etfs) < len(ETF_POOL) * 0.7:
             msg = "⚠️ 数据异常，今日不调仓"
             push(msg)
@@ -218,7 +226,7 @@ def main():
             })
             return
 
-        # ✅ 指数异常保护（使用参数化阈值）
+        # 指数异常保护
         if idx['close'].pct_change().abs().iloc[-1] > CONFIG["INDEX_STOP"]:
             push(f"⚠️ 指数异常波动 > {CONFIG['INDEX_STOP']:.0%}，暂停交易")
             return
@@ -312,7 +320,6 @@ def main():
         logger.info(msg)
 
     finally:
-        # ✅ 统一登出 baostock
         if bs is not None:
             try:
                 bs.logout()
