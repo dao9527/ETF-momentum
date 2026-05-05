@@ -89,39 +89,8 @@ def validate_data(df):
         return False
     return True
 
-# ===== 数据 =====
-def get_index(bs=None):
-    try:
-        df = ak.stock_zh_index_daily_em(symbol=CONFIG["INDEX_CODE"])
-        df.rename(columns={"日期": "date", "收盘": "close"}, inplace=True)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.set_index('date')[['close']]
-        if validate_data(df):
-            return df
-    except Exception as e:
-        logging.warning(f"ak 指数失败: {e}")
-
-    if bs:
-        try:
-            rs = bs.query_history_k_data_plus(
-                f"sh.{CONFIG['INDEX_CODE']}",
-                "date,close",
-                start_date='2015-01-01',
-                end_date=datetime.now().strftime('%Y-%m-%d')
-            )
-            df = rs.get_data()
-            df['date'] = pd.to_datetime(df['date'])
-            df['close'] = pd.to_numeric(df['close'], errors='coerce')
-            df = df.dropna().set_index('date')
-            if validate_data(df):
-                return df
-        except Exception as e:
-            logging.warning(f"bs 指数失败: {e}")
-
-    push("❌ 指数获取失败")
-    return None
-
-def get_etf(code, bs=None):
+# ================= ETF =================
+def get_etf(code):
     try:
         df = ak.fund_etf_hist_em(symbol=code)
         df.rename(columns={
@@ -141,24 +110,48 @@ def get_etf(code, bs=None):
         if validate_data(df):
             return df[['close']]
     except:
-        pass
+        return None
 
-    return None
+# ================= 指数（三重数据源） =================
+def get_index(bs=None):
+    # 🥇 第一层：ETF（最稳）
+    etf_df = get_etf("510300")
+    if etf_df is not None:
+        return etf_df, "ETF(510300)"
 
-# ===== 状态 =====
-def load_state():
+    # 🥈 第二层：akshare
     try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE) as f:
-                return json.load(f)
-    except:
-        pass
-    return {"nav": 1.0, "peak": 1.0, "pos": {}, "pause_until": None}
+        df = ak.stock_zh_index_daily_em(symbol=CONFIG["INDEX_CODE"])
+        df.rename(columns={"日期": "date", "收盘": "close"}, inplace=True)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.set_index('date')[['close']]
+        if validate_data(df):
+            return df, "AKSHARE"
+    except Exception as e:
+        logging.warning(f"ak失败: {e}")
 
-def save_state(s):
-    safe_write_json(STATE_FILE, s)
+    # 🥉 第三层：baostock
+    if bs:
+        try:
+            rs = bs.query_history_k_data_plus(
+                f"sh.{CONFIG['INDEX_CODE']}",
+                "date,close",
+                start_date='2015-01-01',
+                end_date=datetime.now().strftime('%Y-%m-%d')
+            )
+            df = rs.get_data()
+            df['date'] = pd.to_datetime(df['date'])
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            df = df.dropna().set_index('date')
+            if validate_data(df):
+                return df, "BAOSTOCK"
+        except Exception as e:
+            logging.warning(f"bs失败: {e}")
 
-# ===== 策略 =====
+    push("❌ 三数据源全部失败")
+    return None, "FAIL"
+
+# ================= 策略 =================
 def momentum(df):
     if len(df) < 60:
         return None
@@ -166,12 +159,43 @@ def momentum(df):
     vol = df['close'].pct_change().tail(20).std()
     return ret / max(vol, 1e-6)
 
+def market_coef(series):
+    if len(series) < 200:
+        return 0.5
+    ma = series.rolling(200).mean().iloc[-1]
+    dev = (series.iloc[-1] - ma) / ma
+    if dev < -0.05: return 0
+    if dev < -0.03: return 0.3
+    if dev < -0.01: return 0.6
+    return 1
+
+# ================= 状态 =================
+def load_state():
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE) as f:
+                return json.load(f)
+    except:
+        pass
+    return {"nav": 1.0, "peak": 1.0, "pos": {}}
+
+def save_state(s):
+    safe_write_json(STATE_FILE, s)
+
+# ================= 主程序 =================
 def main():
     if not acquire_lock():
         return
 
+    bs = None
     try:
-        idx = get_index()
+        import baostock as bs
+        bs.login()
+    except:
+        bs = None
+
+    try:
+        idx, source = get_index(bs)
         if idx is None:
             return
 
@@ -184,12 +208,11 @@ def main():
 
         valid = len(etfs)
 
-        # 👉 新增：扫描反馈
-        scan_msg = f"扫描ETF: {total} / 有效: {valid}"
-        push(scan_msg)
+        # ===== 推送 =====
+        msg = f"指数来源:{source}\n扫描ETF:{total}/有效:{valid}\n"
 
         if valid < total * 0.5:
-            push("⚠️ 数据异常，停止")
+            push(msg + "⚠️ 数据异常")
             return
 
         scores = [(n, momentum(df)) for n, df in etfs.items()]
@@ -198,21 +221,24 @@ def main():
 
         selected = [n for n, _ in scores[:CONFIG["TOP_N"]]]
 
-        state = load_state()
-
         target = {}
         if selected:
-            w = 1 / len(selected)
+            mcoef = market_coef(idx['close'])
+            w = mcoef / len(selected)
             for n in selected:
                 target[n] = min(w, CONFIG["MAX_SINGLE"])
 
-        msg = f"{scan_msg}\n持仓:"
-        msg += "空仓" if not target else ",".join([f"{k}({v:.0%})" for k, v in target.items()])
+        msg += "空仓" if not target else "持仓:" + ",".join([f"{k}({v:.0%})" for k, v in target.items()])
 
         push(msg)
         logging.info(msg)
 
     finally:
+        if bs:
+            try:
+                bs.logout()
+            except:
+                pass
         release_lock()
 
 if __name__ == "__main__":
