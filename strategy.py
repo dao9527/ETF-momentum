@@ -2,53 +2,72 @@
 # -*- coding: utf-8 -*-
 
 """
-ETF 轮动策略 · 最终稳定版（权重信号版）
+ETF rotation strategy - weight signal version (final stable)
 
-特点：
-- 不再计算买多少股
-- 不再跟踪 holdings/cash
-- 不再累计仓位误差
-- 只输出“目标仓位百分比”
-- 更适合手动交易
-- GitHub Actions 长期运行更稳定
+Fixes vs original:
 
-你只需要：
-1. 替换原 py 文件
-2. 保留 workflow / requirements / secrets
-3. 每天看 Bark 推送手动调仓
+1. baostock module/session variable conflict resolved
+2. Bark URL encoding added (urllib.parse.quote)
+3. Momentum volatility floor raised 1e-6 -> 0.001
+4. market_coef thresholds relaxed for A-share volatility
+5. bare except -> except Exception throughout
+6. Lock file removed (meaningless in GitHub Actions)
+7. Trading day check simplified to weekday-only
+8. Retry wrapper added for flaky network requests
+9. ETF skip logging added for visibility
 
+Usage:
+Replace the .py file in your repo,
+keep workflow / secrets / requirements unchanged.
 """
 
 import os
 import logging
 import requests
 import pandas as pd
-import numpy as np
 import time
 from datetime import datetime
-import akshare as ak
+from urllib.parse import quote
 
-# ======================== 用户配置 ========================
+# ======================== Optional dependencies ========================
+
+try:
+    import baostock as baostock_lib
+    BAOSTOCK_AVAILABLE = True
+except ImportError:
+    BAOSTOCK_AVAILABLE = False
+
+try:
+    import akshare as ak
+    AKSHARE_AVAILABLE = True
+except ImportError:
+    AKSHARE_AVAILABLE = False
+
+# ======================== Config ========================
 
 BARK_KEY = os.getenv("BARK_KEY", "")
 
 CONFIG = {
     "INDEX_CODE": "000300",
 
-    # 趋势参数
+    # Trend parameters
     "MA": 200,
     "MOM": 60,
     "VOL": 20,
 
-    # 持仓
+    # Position settings
     "TOP_N": 2,
     "MAX_SINGLE": 0.4,
 
-    # 流动性过滤
+    # Liquidity filter (CNY)
     "MIN_AMOUNT": 5e7,
+
+    # Retry settings
+    "RETRY_TIMES": 3,
+    "RETRY_SLEEP": 2,
 }
 
-# ======================== ETF池（最终版） ========================
+# ======================== ETF Pool ========================
 
 ETF_POOL = {
     "159875": "新能源",
@@ -63,54 +82,79 @@ ETF_POOL = {
     "512400": "有色金属",
 }
 
-# ======================== 文件 ========================
-
-LOCK_FILE = "lock"
+# ======================== Logging ========================
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# ======================== 工具 ========================
+# ======================== Push ========================
 
 def push(msg):
+    """Send Bark notification."""
+
     if not BARK_KEY:
         return
 
     try:
-        # Bark 单条不要太长
-        parts = [msg[i:i+180] for i in range(0, len(msg), 180)]
+        parts = [msg[i:i + 180] for i in range(0, len(msg), 180)]
 
         for p in parts:
+            encoded = quote(p, safe="")
+
             requests.get(
-                f"https://api.day.app/{BARK_KEY}/{p}",
+                f"https://api.day.app/{BARK_KEY}/{encoded}",
                 timeout=10
             )
+
             time.sleep(0.5)
 
     except Exception as e:
-        logging.warning(f"Bark失败: {e}")
+        logging.warning(f"Bark push failed: {e}")
 
-def acquire_lock():
-    if os.path.exists(LOCK_FILE):
+# ======================== Helpers ========================
 
-        # 超过1小时自动清理
-        if time.time() - os.path.getmtime(LOCK_FILE) > 3600:
-            os.remove(LOCK_FILE)
-        else:
-            return False
+def is_trading_day():
+    """
+    Weekend filter only.
+    """
 
-    with open(LOCK_FILE, "w") as f:
-        f.write(str(os.getpid()))
+    return datetime.now().weekday() < 5
 
-    return True
 
-def release_lock():
-    if os.path.exists(LOCK_FILE):
-        os.remove(LOCK_FILE)
+def retry(func, *args, **kwargs):
+    """
+    Simple retry wrapper.
+    """
+
+    times = CONFIG["RETRY_TIMES"]
+    sleep = CONFIG["RETRY_SLEEP"]
+
+    last_exc = None
+
+    for attempt in range(times):
+
+        try:
+            return func(*args, **kwargs)
+
+        except Exception as e:
+            last_exc = e
+
+            logging.warning(
+                f"Attempt {attempt + 1}/{times} failed: {e}"
+            )
+
+            if attempt < times - 1:
+                time.sleep(sleep)
+
+    raise last_exc
+
 
 def validate_data(df):
+    """
+    Basic dataframe validation.
+    """
 
     if df is None:
         return False
@@ -120,188 +164,254 @@ def validate_data(df):
 
     try:
         df.index = pd.to_datetime(df.index)
-    except:
+
+    except Exception:
         return False
 
-    # 最多允许5天没更新（周末/长假）
     if (datetime.now().date() - df.index[-1].date()).days > 5:
         return False
 
-    if 'close' not in df.columns:
+    if "close" not in df.columns:
         return False
 
-    if df['close'].isna().any():
+    if df["close"].isna().any():
         return False
 
-    if df['close'].iloc[-1] <= 0:
+    if df["close"].iloc[-1] <= 0:
         return False
 
     return True
 
-# ======================== ETF数据 ========================
+# ======================== ETF Data ========================
 
-def get_etf(code, bs=None):
+def _fetch_etf_akshare(code):
 
-    # ---------- AKShare ----------
-    try:
+    df = ak.fund_etf_hist_em(symbol=code)
 
-        df = ak.fund_etf_hist_em(symbol=code)
+    if df is None or df.empty:
+        return None
 
-        if df is not None and not df.empty:
+    df.rename(columns={
+        "日期": "date",
+        "收盘": "close",
+        "成交额": "amount",
+        "成交金额": "amount",
+    }, inplace=True)
 
-            df.rename(columns={
-                '日期': 'date',
-                '收盘': 'close',
-                '成交额': 'amount',
-                '成交金额': 'amount'
-            }, inplace=True)
+    df["date"] = pd.to_datetime(df["date"])
 
-            df['date'] = pd.to_datetime(df['date'])
+    df = df.set_index("date").sort_index()
 
-            df = df.set_index('date').sort_index()
+    if "amount" in df.columns:
 
-            # 流动性过滤
-            if 'amount' in df.columns:
+        amt = pd.to_numeric(
+            df["amount"],
+            errors="coerce"
+        )
 
-                amt = pd.to_numeric(df['amount'], errors='coerce')
+        if amt.tail(20).mean() < CONFIG["MIN_AMOUNT"]:
 
-                if amt.tail(20).mean() < CONFIG["MIN_AMOUNT"]:
-                    return None
+            logging.info(
+                f"ETF {code} liquidity too low, skipped"
+            )
 
-            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            return None
 
-            if validate_data(df):
-                return df[['close']]
+    df["close"] = pd.to_numeric(
+        df["close"],
+        errors="coerce"
+    )
 
-    except Exception as e:
-        logging.warning(f"AK ETF失败 {code}: {e}")
+    return df[["close"]] if validate_data(df) else None
 
-    # ---------- Baostock ----------
-    if bs:
+
+def _fetch_etf_baostock(code, bs_session):
+
+    bs_code = (
+        f"sh.{code}"
+        if code.startswith("51") or code.startswith("58")
+        else f"sz.{code}"
+    )
+
+    rs = bs_session.query_history_k_data_plus(
+        bs_code,
+        "date,close,volume",
+        start_date="2015-01-01",
+        end_date=datetime.now().strftime("%Y-%m-%d"),
+    )
+
+    df = rs.get_data()
+
+    if df.empty:
+        return None
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    df["close"] = pd.to_numeric(
+        df["close"],
+        errors="coerce"
+    )
+
+    df["volume"] = pd.to_numeric(
+        df["volume"],
+        errors="coerce"
+    )
+
+    df = df.dropna().set_index("date")
+
+    df["amount"] = df["close"] * df["volume"]
+
+    if df["amount"].tail(20).mean() < CONFIG["MIN_AMOUNT"]:
+
+        logging.info(
+            f"ETF {code} (baostock) liquidity too low"
+        )
+
+        return None
+
+    return df[["close"]] if validate_data(df) else None
+
+
+def get_etf(code, bs_session=None):
+
+    if AKSHARE_AVAILABLE:
 
         try:
+            df = retry(_fetch_etf_akshare, code)
 
-            bs_code = (
-                f"sh.{code}"
-                if code.startswith("51") or code.startswith("58")
-                else f"sz.{code}"
-            )
-
-            rs = bs.query_history_k_data_plus(
-                bs_code,
-                "date,close,volume",
-                start_date="2015-01-01",
-                end_date=datetime.now().strftime("%Y-%m-%d")
-            )
-
-            df = rs.get_data()
-
-            if not df.empty:
-
-                df['date'] = pd.to_datetime(df['date'])
-
-                df['close'] = pd.to_numeric(
-                    df['close'],
-                    errors='coerce'
-                )
-
-                df['volume'] = pd.to_numeric(
-                    df['volume'],
-                    errors='coerce'
-                )
-
-                df = df.dropna().set_index('date')
-
-                df['amount'] = df['close'] * df['volume']
-
-                if df['amount'].tail(20).mean() < CONFIG["MIN_AMOUNT"]:
-                    return None
-
-                if validate_data(df):
-                    return df[['close']]
+            if df is not None:
+                return df
 
         except Exception as e:
-            logging.warning(f"BS ETF失败 {code}: {e}")
+            logging.warning(
+                f"AKShare ETF failed {code}: {e}"
+            )
+
+    if bs_session is not None:
+
+        try:
+            df = retry(
+                _fetch_etf_baostock,
+                code,
+                bs_session
+            )
+
+            if df is not None:
+                return df
+
+        except Exception as e:
+            logging.warning(
+                f"Baostock ETF failed {code}: {e}"
+            )
 
     return None
 
-# ======================== 指数（三源） ========================
+# ======================== Index Data ========================
 
-def get_index(bs=None):
+def _fetch_index_akshare():
 
-    # ---------- 第一优先：510300 ----------
-    etf = get_etf("510300", bs)
+    df = ak.stock_zh_index_daily_em(
+        symbol=CONFIG["INDEX_CODE"]
+    )
 
-    if etf is not None:
-        return etf, "ETF(510300)"
+    if df is None or df.empty:
+        return None
 
-    # ---------- 第二优先：AKShare指数 ----------
+    df.rename(columns={
+        "日期": "date",
+        "收盘": "close"
+    }, inplace=True)
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    df = df.set_index("date")
+
+    df["close"] = pd.to_numeric(
+        df["close"],
+        errors="coerce"
+    )
+
+    df = df[["close"]]
+
+    return df if validate_data(df) else None
+
+
+def _fetch_index_baostock(bs_session):
+
+    rs = bs_session.query_history_k_data_plus(
+        f"sh.{CONFIG['INDEX_CODE']}",
+        "date,close",
+        start_date="2015-01-01",
+        end_date=datetime.now().strftime("%Y-%m-%d"),
+    )
+
+    df = rs.get_data()
+
+    if df.empty:
+        return None
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    df["close"] = pd.to_numeric(
+        df["close"],
+        errors="coerce"
+    )
+
+    df = df.dropna().set_index("date")
+
+    return df[["close"]] if validate_data(df) else None
+
+
+def get_index(bs_session=None):
+
     try:
 
-        df = ak.stock_zh_index_daily_em(
-            symbol=CONFIG["INDEX_CODE"]
-        )
+        df = get_etf("510300", bs_session)
 
-        if df is not None and not df.empty:
-
-            df.rename(columns={
-                "日期": "date",
-                "收盘": "close"
-            }, inplace=True)
-
-            df['date'] = pd.to_datetime(df['date'])
-
-            df = df.set_index('date')
-
-            df['close'] = pd.to_numeric(
-                df['close'],
-                errors='coerce'
-            )
-
-            df = df[['close']]
-
-            if validate_data(df):
-                return df, "AKSHARE"
+        if df is not None:
+            return df, "ETF(510300)"
 
     except Exception as e:
-        logging.warning(f"AK指数失败: {e}")
+        logging.warning(
+            f"Index source ETF failed: {e}"
+        )
 
-    # ---------- 第三优先：Baostock ----------
-    if bs:
+    if AKSHARE_AVAILABLE:
 
         try:
 
-            rs = bs.query_history_k_data_plus(
-                f"sh.{CONFIG['INDEX_CODE']}",
-                "date,close",
-                start_date="2015-01-01",
-                end_date=datetime.now().strftime("%Y-%m-%d")
-            )
+            df = retry(_fetch_index_akshare)
 
-            df = rs.get_data()
-
-            if not df.empty:
-
-                df['date'] = pd.to_datetime(df['date'])
-
-                df['close'] = pd.to_numeric(
-                    df['close'],
-                    errors='coerce'
-                )
-
-                df = df.dropna().set_index('date')
-
-                if validate_data(df):
-                    return df[['close']], "BAOSTOCK"
+            if df is not None:
+                return df, "AKSHARE"
 
         except Exception as e:
-            logging.warning(f"BS指数失败: {e}")
+            logging.warning(
+                f"AKShare index failed: {e}"
+            )
 
-    push("❌ 指数三源全部失败")
+    if bs_session is not None:
+
+        try:
+
+            df = retry(
+                _fetch_index_baostock,
+                bs_session
+            )
+
+            if df is not None:
+                return df, "BAOSTOCK"
+
+        except Exception as e:
+            logging.warning(
+                f"Baostock index failed: {e}"
+            )
+
+    push("All index sources failed")
 
     return None, "FAIL"
 
-# ======================== 动量 ========================
+# ======================== Signals ========================
 
 def momentum(df):
 
@@ -311,24 +421,23 @@ def momentum(df):
     try:
 
         ret = (
-            df['close'].iloc[-1]
-            / df['close'].iloc[-CONFIG["MOM"]]
+            df["close"].iloc[-1]
+            / df["close"].iloc[-CONFIG["MOM"]]
             - 1
         )
 
         vol = (
-            df['close']
+            df["close"]
             .pct_change()
             .tail(CONFIG["VOL"])
             .std()
         )
 
-        return ret / max(vol, 1e-6)
+        return ret / max(vol, 0.001)
 
-    except:
+    except Exception:
         return None
 
-# ======================== 大盘风控 ========================
 
 def market_coef(series):
 
@@ -344,77 +453,104 @@ def market_coef(series):
 
     dev = (series.iloc[-1] - ma) / ma
 
-    if dev < -0.05:
-        return 0
+    if dev < -0.10:
+        return 0.0
 
-    if dev < -0.03:
+    if dev < -0.06:
         return 0.3
 
-    if dev < -0.01:
+    if dev < -0.03:
         return 0.6
 
-    return 1
+    return 1.0
 
-# ======================== 主程序 ========================
+# ======================== Main ========================
 
 def main():
 
-    if not acquire_lock():
-        logging.info("已有实例运行")
+    if not is_trading_day():
+
+        logging.info("Weekend, skipping")
+
         return
 
-    bs = None
+    bs_session = None
+
+    if BAOSTOCK_AVAILABLE:
+
+        try:
+
+            result = baostock_lib.login()
+
+            if result.error_code == "0":
+
+                bs_session = baostock_lib
+
+                logging.info("Baostock login OK")
+
+            else:
+
+                logging.warning(
+                    f"Baostock login failed: "
+                    f"{result.error_msg}"
+                )
+
+        except Exception as e:
+            logging.warning(
+                f"Baostock init failed: {e}"
+            )
 
     try:
-        import baostock as bs
-        bs.login()
-    except Exception as e:
-        logging.warning(f"Baostock登录失败: {e}")
-        bs = None
 
-    try:
-
-        # ---------- 获取指数 ----------
-        idx, source = get_index(bs)
+        idx, source = get_index(bs_session)
 
         if idx is None:
+
+            logging.error(
+                "Cannot fetch index data"
+            )
+
             return
 
-        # ---------- 市场系数 ----------
-        mcoef = market_coef(idx['close'])
+        mcoef = market_coef(idx["close"])
 
-        # ---------- 获取ETF ----------
         etfs = {}
 
         for code, name in ETF_POOL.items():
 
-            df = get_etf(code, bs)
+            df = get_etf(code, bs_session)
 
             if df is not None:
+
                 etfs[code] = {
                     "name": name,
                     "df": df
                 }
 
+            else:
+
+                logging.warning(
+                    f"ETF {code}({name}) unavailable"
+                )
+
         total = len(ETF_POOL)
+
         valid = len(etfs)
 
-        # ---------- 数据冻结 ----------
         if valid < total * 0.5:
 
             push(
-                f"⚠️ 数据异常\n"
-                f"有效ETF: {valid}/{total}"
+                f"Data warning: "
+                f"{valid}/{total} ETFs valid"
             )
 
             return
 
-        # ---------- 动量排名 ----------
         scores = []
 
         for code, info in etfs.items():
 
-            mom = momentum(info['df'])
+            mom = momentum(info["df"])
 
             if mom is not None:
                 scores.append((code, mom))
@@ -426,7 +562,6 @@ def main():
 
         selected = scores[:CONFIG["TOP_N"]]
 
-        # ---------- 目标仓位 ----------
         targets = {}
 
         if selected and mcoef > 0:
@@ -441,47 +576,44 @@ def main():
                 targets[code] = {
                     "name": ETF_POOL[code],
                     "weight": weight,
-                    "score": round(score, 2)
+                    "score": round(score, 2),
                 }
 
-        # ---------- 推送 ----------
-        msg = ""
+        today_str = datetime.now().strftime("%Y-%m-%d")
 
-        msg += f"📊 指数来源: {source}\n"
+        msg = f"ETF Signal {today_str}\n"
 
-        msg += (
-            f"扫描ETF: {valid}/{total}\n"
-        )
+        msg += f"Index: {source}\n"
 
-        msg += (
-            f"市场系数: {mcoef:.2f}\n\n"
-        )
+        msg += f"ETFs: {valid}/{total}\n"
+
+        msg += f"Market coef: {mcoef:.2f}\n\n"
 
         if not targets:
 
-            msg += "建议空仓"
+            msg += "Hold cash"
 
         else:
 
-            msg += "目标仓位:\n"
+            msg += "Target weights:\n"
 
-            total_weight = 0
+            total_weight = 0.0
 
             for code, info in targets.items():
 
-                w = info['weight']
+                w = info["weight"]
 
                 total_weight += w
 
                 msg += (
-                    f"{info['name']} "
+                    f"{info['name']}({code}) "
                     f"{w:.0%}\n"
                 )
 
-            cash = 1 - total_weight
+            cash = 1.0 - total_weight
 
-            if cash > 0:
-                msg += f"现金 {cash:.0%}"
+            if cash > 0.001:
+                msg += f"Cash {cash:.0%}"
 
         push(msg)
 
@@ -489,21 +621,20 @@ def main():
 
     except Exception as e:
 
-        logging.exception("主程序异常")
+        logging.exception("Main loop error")
 
-        push(f"❌ 异常: {str(e)[:120]}")
+        push(f"Error: {str(e)[:120]}")
 
     finally:
 
-        if bs:
+        if bs_session is not None:
+
             try:
-                bs.logout()
-            except:
+                baostock_lib.logout()
+
+            except Exception:
                 pass
 
-        release_lock()
-
-# ======================== 启动 ========================
 
 if __name__ == "__main__":
     main()
