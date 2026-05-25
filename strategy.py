@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-
 # -*- coding: utf-8 -*-
-
-"""
-ETF rotation strategy - weight signal version (final stable)
-"""
 
 import os
 import logging
@@ -33,7 +28,6 @@ except ImportError:
 BARK_KEY = os.getenv("BARK_KEY", "")
 
 CONFIG = {
-
     "INDEX_CODE": "000300",
 
     # Trend parameters
@@ -78,15 +72,16 @@ logging.basicConfig(
 # ======================== Push ========================
 
 def push(msg):
-    """Send Bark notification."""
 
     if not BARK_KEY:
         return
 
     try:
+
         parts = [msg[i:i + 180] for i in range(0, len(msg), 180)]
 
         for p in parts:
+
             encoded = quote(p, safe="")
 
             requests.get(
@@ -102,12 +97,15 @@ def push(msg):
 # ======================== Helpers ========================
 
 def is_trading_day():
+
+    # Monday-Friday only
     return datetime.now().weekday() < 5
 
 def retry(func, *args, **kwargs):
 
     times = CONFIG["RETRY_TIMES"]
     sleep = CONFIG["RETRY_SLEEP"]
+
     last_exc = None
 
     for attempt in range(times):
@@ -116,8 +114,12 @@ def retry(func, *args, **kwargs):
             return func(*args, **kwargs)
 
         except Exception as e:
+
             last_exc = e
-            logging.warning(f"Attempt {attempt + 1}/{times} failed: {e}")
+
+            logging.warning(
+                f"Attempt {attempt + 1}/{times} failed: {e}"
+            )
 
             if attempt < times - 1:
                 time.sleep(sleep)
@@ -155,10 +157,22 @@ def validate_data(df):
 
 def _fetch_etf_akshare(code):
 
-    df = ak.fund_etf_hist_em(
-        symbol=code,
-        period="daily"
-    )
+    today = datetime.now().strftime("%Y%m%d")
+
+    try:
+
+        df = ak.fund_etf_hist_em(
+            symbol=code,
+            period="daily",
+            start_date="20200101",
+            end_date=today,
+            adjust="qfq"
+        )
+
+    except Exception:
+
+        # fallback
+        df = ak.fund_etf_hist_em(symbol=code)
 
     if df is None or df.empty:
         return None
@@ -171,16 +185,33 @@ def _fetch_etf_akshare(code):
     }, inplace=True)
 
     df["date"] = pd.to_datetime(df["date"])
+
     df = df.set_index("date").sort_index()
 
     if "amount" in df.columns:
-        amt = pd.to_numeric(df["amount"], errors="coerce")
+
+        amt = pd.to_numeric(
+            df["amount"],
+            errors="coerce"
+        )
 
         if amt.tail(20).mean() < CONFIG["MIN_AMOUNT"]:
-            logging.info(f"ETF {code} liquidity too low, skipped")
+
+            logging.info(
+                f"ETF {code} liquidity too low, skipped"
+            )
+
             return None
 
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df["close"] = pd.to_numeric(
+        df["close"],
+        errors="coerce"
+    )
+
+    logging.info(
+        f"ETF {code} rows: {len(df)}, "
+        f"last: {df.index[-1].date()}"
+    )
 
     return df[["close"]] if validate_data(df) else None
 
@@ -205,15 +236,27 @@ def _fetch_etf_baostock(code, bs_session):
         return None
 
     df["date"] = pd.to_datetime(df["date"])
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
+    df["close"] = pd.to_numeric(
+        df["close"],
+        errors="coerce"
+    )
+
+    df["volume"] = pd.to_numeric(
+        df["volume"],
+        errors="coerce"
+    )
 
     df = df.dropna().set_index("date")
 
     df["amount"] = df["close"] * df["volume"]
 
     if df["amount"].tail(20).mean() < CONFIG["MIN_AMOUNT"]:
-        logging.info(f"ETF {code} (baostock) liquidity too low")
+
+        logging.info(
+            f"ETF {code} (baostock) liquidity too low"
+        )
+
         return None
 
     return df[["close"]] if validate_data(df) else None
@@ -221,24 +264,38 @@ def _fetch_etf_baostock(code, bs_session):
 def get_etf(code, bs_session=None):
 
     if AKSHARE_AVAILABLE:
+
         try:
+
             df = retry(_fetch_etf_akshare, code)
 
             if df is not None:
                 return df
 
         except Exception as e:
-            logging.warning(f"AKShare ETF failed {code}: {e}")
+
+            logging.warning(
+                f"AKShare ETF failed {code}: {e}"
+            )
 
     if bs_session is not None:
+
         try:
-            df = retry(_fetch_etf_baostock, code, bs_session)
+
+            df = retry(
+                _fetch_etf_baostock,
+                code,
+                bs_session
+            )
 
             if df is not None:
                 return df
 
         except Exception as e:
-            logging.warning(f"Baostock ETF failed {code}: {e}")
+
+            logging.warning(
+                f"Baostock ETF failed {code}: {e}"
+            )
 
     return None
 
@@ -259,6 +316,7 @@ def _fetch_index_akshare():
     }, inplace=True)
 
     df["date"] = pd.to_datetime(df["date"])
+
     df = df.set_index("date")
 
     df["close"] = pd.to_numeric(
@@ -297,34 +355,54 @@ def _fetch_index_baostock(bs_session):
 
 def get_index(bs_session=None):
 
+    # ETF proxy first
     try:
+
         df = get_etf("510300", bs_session)
 
         if df is not None:
             return df, "ETF(510300)"
 
     except Exception as e:
-        logging.warning(f"Index source ETF failed: {e}")
 
+        logging.warning(
+            f"Index source ETF failed: {e}"
+        )
+
+    # AKShare index
     if AKSHARE_AVAILABLE:
+
         try:
+
             df = retry(_fetch_index_akshare)
 
             if df is not None:
                 return df, "AKSHARE"
 
         except Exception as e:
-            logging.warning(f"AKShare index failed: {e}")
 
+            logging.warning(
+                f"AKShare index failed: {e}"
+            )
+
+    # Baostock fallback
     if bs_session is not None:
+
         try:
-            df = retry(_fetch_index_baostock, bs_session)
+
+            df = retry(
+                _fetch_index_baostock,
+                bs_session
+            )
 
             if df is not None:
                 return df, "BAOSTOCK"
 
         except Exception as e:
-            logging.warning(f"Baostock index failed: {e}")
+
+            logging.warning(
+                f"Baostock index failed: {e}"
+            )
 
     push("All index sources failed")
 
@@ -338,6 +416,7 @@ def momentum(df):
         return None
 
     try:
+
         ret = (
             df["close"].iloc[-1]
             / df["close"].iloc[-CONFIG["MOM"]]
@@ -360,23 +439,33 @@ def market_coef(series):
 
     available = len(series)
 
-    if available < CONFIG["MA"]:
+    if available < 60:
+
         logging.warning(
-            f"Index data too short: {available} rows "
-            f"(need {CONFIG['MA']}), coef=0.5"
+            f"Index data too short: {available} rows, coef=0.5"
         )
+
         return 0.5
 
-    ma_val = series.rolling(CONFIG["MA"]).mean().iloc[-1]
+    ma_period = min(CONFIG["MA"], available)
+
+    ma_val = (
+        series
+        .rolling(ma_period)
+        .mean()
+        .iloc[-1]
+    )
 
     if pd.isna(ma_val):
-        logging.warning("MA200 is NaN, coef=0.5")
+
+        logging.warning("MA is NaN, coef=0.5")
+
         return 0.5
 
     dev = (series.iloc[-1] - ma_val) / ma_val
 
     logging.info(
-        f"MA200={ma_val:.4f}, "
+        f"MA{ma_period}={ma_val:.4f}, "
         f"last={series.iloc[-1]:.4f}, "
         f"dev={dev:.2%}"
     )
@@ -397,33 +486,47 @@ def market_coef(series):
 def main():
 
     if not is_trading_day():
+
         logging.info("Weekend, skipping")
+
         return
 
     bs_session = None
 
     if BAOSTOCK_AVAILABLE:
+
         try:
+
             result = baostock_lib.login()
 
             if result.error_code == "0":
+
                 bs_session = baostock_lib
+
                 logging.info("Baostock login OK")
 
             else:
+
                 logging.warning(
-                    f"Baostock login failed: {result.error_msg}"
+                    f"Baostock login failed: "
+                    f"{result.error_msg}"
                 )
 
         except Exception as e:
-            logging.warning(f"Baostock init failed: {e}")
+
+            logging.warning(
+                f"Baostock init failed: {e}"
+            )
 
     try:
 
+        # ---------- Index ----------
         idx, source = get_index(bs_session)
 
         if idx is None:
+
             logging.error("Cannot fetch index data")
+
             return
 
         logging.info(
@@ -433,6 +536,7 @@ def main():
 
         mcoef = market_coef(idx["close"])
 
+        # ---------- ETF ----------
         etfs = {}
 
         for code, name in ETF_POOL.items():
@@ -440,23 +544,32 @@ def main():
             df = get_etf(code, bs_session)
 
             if df is not None:
+
                 etfs[code] = {
                     "name": name,
                     "df": df
                 }
 
             else:
+
                 logging.warning(
                     f"ETF {code}({name}) unavailable"
                 )
 
         total = len(ETF_POOL)
+
         valid = len(etfs)
 
         if valid < total * 0.5:
-            push(f"Data warning: {valid}/{total} ETFs valid")
+
+            push(
+                f"Data warning: "
+                f"{valid}/{total} ETFs valid"
+            )
+
             return
 
+        # ---------- Momentum ranking ----------
         scores = []
 
         for code, info in etfs.items():
@@ -473,6 +586,7 @@ def main():
 
         selected = scores[:CONFIG["TOP_N"]]
 
+        # ---------- Target weights ----------
         targets = {}
 
         if selected and mcoef > 0:
@@ -483,23 +597,30 @@ def main():
             )
 
             for code, score in selected:
+
                 targets[code] = {
                     "name": ETF_POOL[code],
                     "weight": weight,
                     "score": round(score, 2),
                 }
 
+        # ---------- Message ----------
         today_str = datetime.now().strftime("%Y-%m-%d")
 
         msg = f"ETF Signal {today_str}\n"
+
         msg += f"Index: {source}\n"
+
         msg += f"ETFs: {valid}/{total}\n"
+
         msg += f"Market coef: {mcoef:.2f}\n\n"
 
         if not targets:
+
             msg += "Hold cash"
 
         else:
+
             msg += "Target weights:\n"
 
             total_weight = 0.0
@@ -533,11 +654,13 @@ def main():
     finally:
 
         if bs_session is not None:
+
             try:
                 baostock_lib.logout()
-
             except Exception:
                 pass
+
+# ======================== Start ========================
 
 if __name__ == "__main__":
     main()
