@@ -6,6 +6,7 @@ import logging
 import requests
 import pandas as pd
 import time
+
 from datetime import datetime
 from urllib.parse import quote
 
@@ -30,19 +31,19 @@ BARK_KEY = os.getenv("BARK_KEY", "")
 CONFIG = {
     "INDEX_CODE": "000300",
 
-    # Trend parameters
+    # Trend
     "MA": 200,
     "MOM": 60,
     "VOL": 20,
 
-    # Position settings
+    # Position
     "TOP_N": 2,
     "MAX_SINGLE": 0.4,
 
     # Liquidity filter (CNY)
     "MIN_AMOUNT": 5e7,
 
-    # Retry settings
+    # Retry
     "RETRY_TIMES": 3,
     "RETRY_SLEEP": 2,
 }
@@ -77,7 +78,6 @@ def push(msg):
         return
 
     try:
-
         parts = [msg[i:i + 180] for i in range(0, len(msg), 180)]
 
         for p in parts:
@@ -97,8 +97,6 @@ def push(msg):
 # ======================== Helpers ========================
 
 def is_trading_day():
-
-    # Monday-Friday only
     return datetime.now().weekday() < 5
 
 def retry(func, *args, **kwargs):
@@ -139,7 +137,9 @@ def validate_data(df):
     except Exception:
         return False
 
-    if (datetime.now().date() - df.index[-1].date()).days > 5:
+    if (
+        datetime.now().date() - df.index[-1].date()
+    ).days > 5:
         return False
 
     if "close" not in df.columns:
@@ -251,7 +251,10 @@ def _fetch_etf_baostock(code, bs_session):
 
     df["amount"] = df["close"] * df["volume"]
 
-    if df["amount"].tail(20).mean() < CONFIG["MIN_AMOUNT"]:
+    if (
+        df["amount"].tail(20).mean()
+        < CONFIG["MIN_AMOUNT"]
+    ):
 
         logging.info(
             f"ETF {code} (baostock) liquidity too low"
@@ -355,7 +358,8 @@ def _fetch_index_baostock(bs_session):
 
 def get_index(bs_session=None):
 
-    # ETF proxy first
+    # source 1: ETF proxy
+
     try:
 
         df = get_etf("510300", bs_session)
@@ -369,7 +373,8 @@ def get_index(bs_session=None):
             f"Index source ETF failed: {e}"
         )
 
-    # AKShare index
+    # source 2: AKShare index
+
     if AKSHARE_AVAILABLE:
 
         try:
@@ -385,7 +390,8 @@ def get_index(bs_session=None):
                 f"AKShare index failed: {e}"
             )
 
-    # Baostock fallback
+    # source 3: Baostock
+
     if bs_session is not None:
 
         try:
@@ -439,14 +445,16 @@ def market_coef(series):
 
     available = len(series)
 
+    # extreme abnormal case
     if available < 60:
 
         logging.warning(
-            f"Index data too short: {available} rows, coef=0.5"
+            f"Data only {available} rows, coef=0.5"
         )
 
         return 0.5
 
+    # dynamic MA
     ma_period = min(CONFIG["MA"], available)
 
     ma_val = (
@@ -458,11 +466,15 @@ def market_coef(series):
 
     if pd.isna(ma_val):
 
-        logging.warning("MA is NaN, coef=0.5")
+        logging.warning(
+            "MA is NaN, coef=0.5"
+        )
 
         return 0.5
 
-    dev = (series.iloc[-1] - ma_val) / ma_val
+    dev = (
+        series.iloc[-1] - ma_val
+    ) / ma_val
 
     logging.info(
         f"MA{ma_period}={ma_val:.4f}, "
@@ -487,11 +499,15 @@ def main():
 
     if not is_trading_day():
 
-        logging.info("Weekend, skipping")
+        logging.info(
+            "Weekend, skipping"
+        )
 
         return
 
     bs_session = None
+
+    # optional baostock login
 
     if BAOSTOCK_AVAILABLE:
 
@@ -503,7 +519,9 @@ def main():
 
                 bs_session = baostock_lib
 
-                logging.info("Baostock login OK")
+                logging.info(
+                    "Baostock login OK"
+                )
 
             else:
 
@@ -520,12 +538,15 @@ def main():
 
     try:
 
-        # ---------- Index ----------
+        # ======================== Index ========================
+
         idx, source = get_index(bs_session)
 
         if idx is None:
 
-            logging.error("Cannot fetch index data")
+            logging.error(
+                "Cannot fetch index data"
+            )
 
             return
 
@@ -536,7 +557,8 @@ def main():
 
         mcoef = market_coef(idx["close"])
 
-        # ---------- ETF ----------
+        # ======================== ETF Data ========================
+
         etfs = {}
 
         for code, name in ETF_POOL.items():
@@ -569,7 +591,8 @@ def main():
 
             return
 
-        # ---------- Momentum ranking ----------
+        # ======================== Momentum ========================
+
         scores = []
 
         for code, info in etfs.items():
@@ -577,6 +600,7 @@ def main():
             mom = momentum(info["df"])
 
             if mom is not None:
+
                 scores.append((code, mom))
 
         scores.sort(
@@ -586,7 +610,8 @@ def main():
 
         selected = scores[:CONFIG["TOP_N"]]
 
-        # ---------- Target weights ----------
+        # ======================== Target Weights ========================
+
         targets = {}
 
         if selected and mcoef > 0:
@@ -604,8 +629,11 @@ def main():
                     "score": round(score, 2),
                 }
 
-        # ---------- Message ----------
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        # ======================== Message ========================
+
+        today_str = datetime.now().strftime(
+            "%Y-%m-%d"
+        )
 
         msg = f"ETF Signal {today_str}\n"
 
@@ -647,7 +675,9 @@ def main():
 
     except Exception as e:
 
-        logging.exception("Main loop error")
+        logging.exception(
+            "Main loop error"
+        )
 
         push(f"Error: {str(e)[:120]}")
 
@@ -659,8 +689,6 @@ def main():
                 baostock_lib.logout()
             except Exception:
                 pass
-
-# ======================== Start ========================
 
 if __name__ == "__main__":
     main()
