@@ -503,6 +503,8 @@ def main():
     try:
 
         idx, source = get_index(bs_session)
+        logging.info(f"Index data length: {len(idx)}, last date: {idx.index[-1].date()}")  # ← 加这行
+mcoef = market_coef(idx["close"])
 
         if idx is None:
 
