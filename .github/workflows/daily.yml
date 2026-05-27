@@ -29,4 +29,4 @@ jobs:
         env:
           BARK_KEY: ${{ secrets.BARK_KEY }}
         run: |
-          python main.py
+          python strategy.py
