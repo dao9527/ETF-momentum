@@ -1,6 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+ETF Trend Rotation Strategy
+============================
+
+架构：
+    低频调仓 + 高频风控 + 每日健康检查
+
+每日：
+    - 获取指数数据
+    - 检查 ETF 数据健康状态
+    - 风控检查（MA200）
+    - Bark 心跳推送
+
+调仓日（每月第1、第3个周五）：
+    - 运行完整轮动逻辑
+    - 推送正式调仓信号
+
+核心逻辑：
+    - 沪深300 MA200 → 风险开关
+    - 60日风险调整动量 → ETF 选择
+    - 半月调仓 → 降低换手率
+
+设计原则：
+    - 信号周期与执行周期统一
+    - 不确定时保守（coef=0.5）
+    - GitHub Actions 无状态兼容
+"""
+
 import os
 import logging
 import requests
@@ -34,13 +62,13 @@ CONFIG = {
     # Trend
     "MA": 200,
     "MOM": 60,
-    "VOL": 20,
+    "VOL": 60,   # 修复：波动率周期与动量周期统一
 
     # Position
     "TOP_N": 2,
     "MAX_SINGLE": 0.4,
 
-    # Liquidity filter (CNY)
+    # Liquidity
     "MIN_AMOUNT": 5e7,
 
     # Retry
@@ -72,13 +100,19 @@ logging.basicConfig(
 
 # ======================== Push ========================
 
-def push(msg):
+def push(title, body=None):
 
     if not BARK_KEY:
         return
 
+    content = f"{title}\n{body}" if body else title
+
     try:
-        parts = [msg[i:i + 180] for i in range(0, len(msg), 180)]
+
+        parts = [
+            content[i:i + 180]
+            for i in range(0, len(content), 180)
+        ]
 
         for p in parts:
 
@@ -92,12 +126,37 @@ def push(msg):
             time.sleep(0.5)
 
     except Exception as e:
+
         logging.warning(f"Bark push failed: {e}")
 
 # ======================== Helpers ========================
 
 def is_trading_day():
+
     return datetime.now().weekday() < 5
+
+
+def is_rebalance_day():
+    """
+    每月第1、第3个周五
+    """
+
+    today = datetime.now()
+
+    if today.weekday() != 4:
+        return False
+
+    friday_count = sum(
+        1 for d in range(1, today.day + 1)
+        if datetime(
+            today.year,
+            today.month,
+            d
+        ).weekday() == 4
+    )
+
+    return friday_count in (1, 3)
+
 
 def retry(func, *args, **kwargs):
 
@@ -123,6 +182,7 @@ def retry(func, *args, **kwargs):
                 time.sleep(sleep)
 
     raise last_exc
+
 
 def validate_data(df):
 
@@ -171,8 +231,9 @@ def _fetch_etf_akshare(code):
 
     except Exception:
 
-        # fallback
-        df = ak.fund_etf_hist_em(symbol=code)
+        df = ak.fund_etf_hist_em(
+            symbol=code
+        )
 
     if df is None or df.empty:
         return None
@@ -198,7 +259,7 @@ def _fetch_etf_akshare(code):
         if amt.tail(20).mean() < CONFIG["MIN_AMOUNT"]:
 
             logging.info(
-                f"ETF {code} liquidity too low, skipped"
+                f"ETF {code} liquidity too low"
             )
 
             return None
@@ -209,11 +270,12 @@ def _fetch_etf_akshare(code):
     )
 
     logging.info(
-        f"ETF {code} rows: {len(df)}, "
-        f"last: {df.index[-1].date()}"
+        f"ETF {code} rows={len(df)} "
+        f"last={df.index[-1].date()}"
     )
 
     return df[["close"]] if validate_data(df) else None
+
 
 def _fetch_etf_baostock(code, bs_session):
 
@@ -249,7 +311,9 @@ def _fetch_etf_baostock(code, bs_session):
 
     df = df.dropna().set_index("date")
 
-    df["amount"] = df["close"] * df["volume"]
+    df["amount"] = (
+        df["close"] * df["volume"]
+    )
 
     if (
         df["amount"].tail(20).mean()
@@ -257,12 +321,13 @@ def _fetch_etf_baostock(code, bs_session):
     ):
 
         logging.info(
-            f"ETF {code} (baostock) liquidity too low"
+            f"ETF {code} liquidity too low"
         )
 
         return None
 
     return df[["close"]] if validate_data(df) else None
+
 
 def get_etf(code, bs_session=None):
 
@@ -270,7 +335,10 @@ def get_etf(code, bs_session=None):
 
         try:
 
-            df = retry(_fetch_etf_akshare, code)
+            df = retry(
+                _fetch_etf_akshare,
+                code
+            )
 
             if df is not None:
                 return df
@@ -327,9 +395,8 @@ def _fetch_index_akshare():
         errors="coerce"
     )
 
-    df = df[["close"]]
+    return df[["close"]] if validate_data(df) else None
 
-    return df if validate_data(df) else None
 
 def _fetch_index_baostock(bs_session):
 
@@ -356,13 +423,15 @@ def _fetch_index_baostock(bs_session):
 
     return df[["close"]] if validate_data(df) else None
 
-def get_index(bs_session=None):
 
-    # source 1: ETF proxy
+def get_index(bs_session=None):
 
     try:
 
-        df = get_etf("510300", bs_session)
+        df = get_etf(
+            "510300",
+            bs_session
+        )
 
         if df is not None:
             return df, "ETF(510300)"
@@ -370,10 +439,8 @@ def get_index(bs_session=None):
     except Exception as e:
 
         logging.warning(
-            f"Index source ETF failed: {e}"
+            f"Index ETF source failed: {e}"
         )
-
-    # source 2: AKShare index
 
     if AKSHARE_AVAILABLE:
 
@@ -389,8 +456,6 @@ def get_index(bs_session=None):
             logging.warning(
                 f"AKShare index failed: {e}"
             )
-
-    # source 3: Baostock
 
     if bs_session is not None:
 
@@ -410,7 +475,10 @@ def get_index(bs_session=None):
                 f"Baostock index failed: {e}"
             )
 
-    push("All index sources failed")
+    push(
+        "❌ Index Data Failed",
+        "All sources unavailable"
+    )
 
     return None, "FAIL"
 
@@ -429,33 +497,39 @@ def momentum(df):
             - 1
         )
 
+        # 修复：60/60 周期统一
         vol = (
             df["close"]
             .pct_change()
-            .tail(CONFIG["VOL"])
+            .rolling(CONFIG["VOL"])
             .std()
+            .iloc[-1]
         )
 
         return ret / max(vol, 0.001)
 
     except Exception:
+
         return None
+
 
 def market_coef(series):
 
     available = len(series)
 
-    # extreme abnormal case
     if available < 60:
 
         logging.warning(
-            f"Data only {available} rows, coef=0.5"
+            f"Index only {available} rows, "
+            f"coef=0.5 defensive"
         )
 
         return 0.5
 
-    # dynamic MA
-    ma_period = min(CONFIG["MA"], available)
+    ma_period = min(
+        CONFIG["MA"],
+        available
+    )
 
     ma_val = (
         series
@@ -467,7 +541,7 @@ def market_coef(series):
     if pd.isna(ma_val):
 
         logging.warning(
-            "MA is NaN, coef=0.5"
+            "MA is NaN, coef=0.5 defensive"
         )
 
         return 0.5
@@ -477,10 +551,12 @@ def market_coef(series):
     ) / ma_val
 
     logging.info(
-        f"MA{ma_period}={ma_val:.4f}, "
-        f"last={series.iloc[-1]:.4f}, "
+        f"MA{ma_period}={ma_val:.4f} "
+        f"last={series.iloc[-1]:.4f} "
         f"dev={dev:.2%}"
     )
+
+    # 保留阶梯结构（趋势系统更果断）
 
     if dev < -0.10:
         return 0.0
@@ -493,6 +569,172 @@ def market_coef(series):
 
     return 1.0
 
+# ======================== Risk ========================
+
+def run_risk_check(idx_series):
+
+    mcoef = market_coef(idx_series)
+
+    if mcoef == 0.0:
+
+        push(
+            "🚨 Risk Alert",
+            "Suggested: CLEAR ALL"
+        )
+
+    elif mcoef == 0.3:
+
+        push(
+            "⚠️ Risk Alert",
+            "Suggested exposure: 30%"
+        )
+
+    elif mcoef == 0.6:
+
+        push(
+            "📉 Risk Alert",
+            "Suggested exposure: 60%"
+        )
+
+    elif mcoef == 0.5:
+
+        push(
+            "❓ Data Warning",
+            "Index data abnormal, defensive mode"
+        )
+
+    else:
+
+        logging.info(
+            "Risk check OK"
+        )
+
+    return mcoef
+
+# ======================== Health Check ========================
+
+def run_health_check(bs_session=None):
+
+    valid = 0
+    total = len(ETF_POOL)
+
+    for code in ETF_POOL:
+
+        try:
+
+            df = get_etf(code, bs_session)
+
+            if df is not None:
+                valid += 1
+
+        except Exception:
+            pass
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if valid == total:
+
+        push(
+            "💚 Strategy OK",
+            f"{today}\n"
+            f"ETF data OK: {valid}/{total}"
+        )
+
+    else:
+
+        push(
+            "⚠️ ETF Data Warning",
+            f"{today}\n"
+            f"ETF valid: {valid}/{total}"
+        )
+
+    return valid
+
+# ======================== Rebalance ========================
+
+def run_rebalance(etfs, mcoef, idx_source):
+
+    scores = []
+
+    for code, info in etfs.items():
+
+        mom = momentum(info["df"])
+
+        if mom is not None:
+
+            scores.append(
+                (code, mom)
+            )
+
+    scores.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    selected = scores[:CONFIG["TOP_N"]]
+
+    targets = {}
+
+    if selected and mcoef > 0:
+
+        weight = min(
+            mcoef / len(selected),
+            CONFIG["MAX_SINGLE"]
+        )
+
+        for code, score in selected:
+
+            targets[code] = {
+                "name": ETF_POOL[code],
+                "weight": weight,
+                "score": round(score, 2),
+            }
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    body = (
+        f"Date: {today}\n"
+        f"Index: {idx_source}\n"
+        f"Market coef: {mcoef:.2f}\n\n"
+    )
+
+    if not targets:
+
+        body += "Target: CASH 100%"
+
+    else:
+
+        body += "Target weights:\n"
+
+        total_weight = 0.0
+
+        for code, info in targets.items():
+
+            w = info["weight"]
+
+            total_weight += w
+
+            body += (
+                f"{info['name']}({code}) "
+                f"{w:.0%} "
+                f"[score={info['score']}]\n"
+            )
+
+        cash = 1.0 - total_weight
+
+        if cash > 0.001:
+
+            body += (
+                f"Cash {cash:.0%}"
+            )
+
+    push(
+        "📊 Rebalance Signal",
+        body
+    )
+
+    logging.info(body)
+
 # ======================== Main ========================
 
 def main():
@@ -500,14 +742,12 @@ def main():
     if not is_trading_day():
 
         logging.info(
-            "Weekend, skipping"
+            "Weekend skip"
         )
 
         return
 
     bs_session = None
-
-    # optional baostock login
 
     if BAOSTOCK_AVAILABLE:
 
@@ -523,13 +763,6 @@ def main():
                     "Baostock login OK"
                 )
 
-            else:
-
-                logging.warning(
-                    f"Baostock login failed: "
-                    f"{result.error_msg}"
-                )
-
         except Exception as e:
 
             logging.warning(
@@ -538,140 +771,95 @@ def main():
 
     try:
 
-        # ======================== Index ========================
+        # ========================
+        # Index
+        # ========================
 
-        idx, source = get_index(bs_session)
+        idx, idx_source = get_index(bs_session)
 
         if idx is None:
 
             logging.error(
-                "Cannot fetch index data"
+                "Cannot fetch index"
             )
 
             return
 
         logging.info(
-            f"Index rows: {len(idx)}, "
-            f"last date: {idx.index[-1].date()}"
+            f"Index rows={len(idx)} "
+            f"source={idx_source}"
         )
 
-        mcoef = market_coef(idx["close"])
+        # ========================
+        # Daily risk
+        # ========================
 
-        # ======================== ETF Data ========================
+        mcoef = run_risk_check(
+            idx["close"]
+        )
 
-        etfs = {}
+        # ========================
+        # Daily health heartbeat
+        # ========================
 
-        for code, name in ETF_POOL.items():
+        valid = run_health_check(
+            bs_session
+        )
 
-            df = get_etf(code, bs_session)
+        if valid < len(ETF_POOL) * 0.5:
 
-            if df is not None:
-
-                etfs[code] = {
-                    "name": name,
-                    "df": df
-                }
-
-            else:
-
-                logging.warning(
-                    f"ETF {code}({name}) unavailable"
-                )
-
-        total = len(ETF_POOL)
-
-        valid = len(etfs)
-
-        if valid < total * 0.5:
-
-            push(
-                f"Data warning: "
-                f"{valid}/{total} ETFs valid"
+            logging.warning(
+                "Too many ETF failures"
             )
 
             return
 
-        # ======================== Momentum ========================
+        # ========================
+        # Rebalance
+        # ========================
 
-        scores = []
+        if is_rebalance_day():
 
-        for code, info in etfs.items():
-
-            mom = momentum(info["df"])
-
-            if mom is not None:
-
-                scores.append((code, mom))
-
-        scores.sort(
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        selected = scores[:CONFIG["TOP_N"]]
-
-        # ======================== Target Weights ========================
-
-        targets = {}
-
-        if selected and mcoef > 0:
-
-            weight = min(
-                mcoef / len(selected),
-                CONFIG["MAX_SINGLE"]
+            logging.info(
+                "Rebalance day"
             )
 
-            for code, score in selected:
+            etfs = {}
 
-                targets[code] = {
-                    "name": ETF_POOL[code],
-                    "weight": weight,
-                    "score": round(score, 2),
-                }
+            for code, name in ETF_POOL.items():
 
-        # ======================== Message ========================
+                df = get_etf(
+                    code,
+                    bs_session
+                )
 
-        today_str = datetime.now().strftime(
-            "%Y-%m-%d"
-        )
+                if df is not None:
 
-        msg = f"ETF Signal {today_str}\n"
+                    etfs[code] = {
+                        "name": name,
+                        "df": df
+                    }
 
-        msg += f"Index: {source}\n"
+            if len(etfs) < len(ETF_POOL) * 0.5:
 
-        msg += f"ETFs: {valid}/{total}\n"
+                push(
+                    "⚠️ Rebalance Skipped",
+                    "Too many ETF failures"
+                )
 
-        msg += f"Market coef: {mcoef:.2f}\n\n"
+                return
 
-        if not targets:
-
-            msg += "Hold cash"
+            run_rebalance(
+                etfs,
+                mcoef,
+                idx_source
+            )
 
         else:
 
-            msg += "Target weights:\n"
-
-            total_weight = 0.0
-
-            for code, info in targets.items():
-
-                w = info["weight"]
-
-                total_weight += w
-
-                msg += (
-                    f"{info['name']}({code}) "
-                    f"{w:.0%}\n"
-                )
-
-            cash = 1.0 - total_weight
-
-            if cash > 0.001:
-                msg += f"Cash {cash:.0%}"
-
-        push(msg)
-
-        logging.info(msg)
+            logging.info(
+                "Non-rebalance day"
+            )
 
     except Exception as e:
 
@@ -679,7 +867,10 @@ def main():
             "Main loop error"
         )
 
-        push(f"Error: {str(e)[:120]}")
+        push(
+            "❌ Strategy Error",
+            str(e)[:200]
+        )
 
     finally:
 
@@ -689,6 +880,7 @@ def main():
                 baostock_lib.logout()
             except Exception:
                 pass
+
 
 if __name__ == "__main__":
     main()
