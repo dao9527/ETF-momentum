@@ -797,6 +797,7 @@ def main():
             logging.info(
                 "Market closed today"
             )
+            push("⏸ Market Closed", str(datetime.now().date()))
 
             return
 
