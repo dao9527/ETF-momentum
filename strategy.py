@@ -131,9 +131,19 @@ def push(title, body=None):
 
 # ======================== Helpers ========================
 
-def is_trading_day():
+def is_trading_day(idx_df):
+    """
+    用指数最新数据日期判断是否真正开盘。
+    避免节假日误判。
+    """
 
-    return datetime.now().weekday() < 5
+    if idx_df is None or idx_df.empty:
+        return False
+
+    last_date = idx_df.index[-1].date()
+    today = datetime.now().date()
+
+    return last_date == today
 
 
 def is_rebalance_day():
@@ -737,15 +747,8 @@ def run_rebalance(etfs, mcoef, idx_source):
 
 # ======================== Main ========================
 
+
 def main():
-
-    if not is_trading_day():
-
-        logging.info(
-            "Weekend skip"
-        )
-
-        return
 
     bs_session = None
 
@@ -772,7 +775,7 @@ def main():
     try:
 
         # ========================
-        # Index
+        # 获取指数
         # ========================
 
         idx, idx_source = get_index(bs_session)
@@ -781,6 +784,18 @@ def main():
 
             logging.error(
                 "Cannot fetch index"
+            )
+
+            return
+
+        # ========================
+        # 真正交易日判断
+        # ========================
+
+        if not is_trading_day(idx):
+
+            logging.info(
+                "Market closed today"
             )
 
             return
@@ -799,7 +814,7 @@ def main():
         )
 
         # ========================
-        # Daily health heartbeat
+        # Daily heartbeat
         # ========================
 
         valid = run_health_check(
@@ -880,7 +895,6 @@ def main():
                 baostock_lib.logout()
             except Exception:
                 pass
-
 
 if __name__ == "__main__":
     main()
